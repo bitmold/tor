@@ -382,4 +382,13 @@ no-accel 22 default x86_64 r21e 1.1.1l:
 
 no-accel 24 default armeabi-v7a r21e 1.1.1l:
   <<: *android-template
->>>>>>> d2c89a1a55 (gitlab-ci: add complete Android build and test run in emulator):.gitlab-ci.yml
+
+# cppcheck static analyzer
+cppcheck:
+  image: debian:bullseye
+  script:
+    - *apt-template
+    - apt-get install cppcheck
+    - find src -name '*.[ch]' | sort
+        | cppcheck --file-list=- --max-configs=50
+            --enable=information,performance,portability,unusedFunction
