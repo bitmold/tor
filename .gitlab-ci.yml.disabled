@@ -271,3 +271,4 @@ rust-latest:
     - cargo clippy --all-features --all-targets -- -D warnings
   after_script:
     - cargo clean
+
