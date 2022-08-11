@@ -1014,6 +1014,9 @@ Changes in version 0.4.5.13 - 2022-08-11
     - Do not propagate either forward or backward a DESTROY remote reason when
       closing a circuit in order to avoid a possible side channel. Fixes bug
       40649; bugfix on 0.1.2.4-alpha.
+    - Do not propagate either forward or backward a DESTROY remote
+      reason when closing a circuit so to avoid a possible side channel.
+      Fixes bug 40649; bugfix on 0.1.2.4-alpha.
 
 
 Changes in version 0.4.7.8 - 2022-06-17
