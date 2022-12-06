@@ -560,7 +560,6 @@ Changes in version 0.4.7.12 - 2022-12-06
       used by our thread pool. Fixes bug 40719; bugfix on 0.3.5.1-alpha.
 
 
-Changes in version 0.4.5.15 - 2022-12-06
   This version has several major changes for directory authorities. And a
   major bugfix on OSX. Again, we strongly recommend to upgrade to our 0.4.7.x
   series latest stable. This series is EOL on February 15th, 2023.
