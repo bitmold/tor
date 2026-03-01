@@ -174,6 +174,15 @@ SetCommandLine(JNIEnv *env, jobject thisObj, jobjectArray arrArgv)
   return true;
 }
 
+#include "lib/err/torerr.h"
+JNIEXPORT jboolean JNICALL
+Java_org_torproject_jni_TorService_fatal
+(JNIEnv *env, jobject thisObj)
+{
+  tor_raw_abort_();
+  return true;
+}
+
 static int
 SetupControlSocket(JNIEnv *env, jobject thisObj)
 {

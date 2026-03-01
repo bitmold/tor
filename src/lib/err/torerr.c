@@ -213,6 +213,63 @@ tor_raw_assertion_failed_msg_(const char *file, int line, const char *expr,
   tor_log_err_sigsafe_write("\n");
 }
 
+#define LOGCAT_TAG "OrbotAbortReport"
+#include <jni.h>
+#include <dlfcn.h>
+#include <android/log.h>
+typedef jint (*GetCreatedJavaVMs)(JavaVM **pvm[], jint count, jint *num);
+void attempt_to_tell_orbot_of_abort(void);
+void attempt_to_tell_orbot_of_abort(void)
+{
+  static const char* possibleLibs[] = {"libnativehelper.so", "libart.so", "libdvm.so", NULL};
+  GetCreatedJavaVMs getCreatedJavaVMs = NULL;
+  const char ** libPointer = possibleLibs;
+  while (*libPointer != NULL) {
+    void *lib = dlopen(*libPointer, RTLD_NOW);
+    if (lib) {
+      getCreatedJavaVMs = (GetCreatedJavaVMs)dlsym(lib, "JNI_GetCreatedJavaVMs");
+      break;
+    }
+    libPointer++;
+  }
+
+  if (!getCreatedJavaVMs) {
+    __android_log_print(ANDROID_LOG_VERBOSE, LOGCAT_TAG, "couldnt dlsym JNI_GetCreatedJavaVMs method");
+    return;
+  }
+
+  JavaVM *jvm;
+  int jvmCreatedSize;
+  jint result = getCreatedJavaVMs(&jvm, 1, &jvmCreatedSize);
+  if (result != JNI_OK) {
+    __android_log_print(ANDROID_LOG_VERBOSE, LOGCAT_TAG, "issue with JVM");
+    return;
+  }
+
+  // Attach the current thread to the JVM
+  JNIEnv* jniEnv;
+  result = (*jvm)->AttachCurrentThread(jvm, (void**)&jniEnv, NULL);
+  if (result != JNI_OK) {
+    __android_log_print(ANDROID_LOG_VERBOSE, LOGCAT_TAG, "couldn't attach to current thread in JVM");
+    return;
+  }
+
+  jclass clazz = (*jniEnv)->FindClass(jniEnv, "org/torproject/jni/TorService");
+  if (!clazz) {
+    __android_log_print(ANDROID_LOG_VERBOSE, LOGCAT_TAG, "couldn't find TorService class");
+    return;
+  }
+
+  jmethodID func = (*jniEnv)->GetStaticMethodID(jniEnv, clazz, "onTorRawAbort", "()V");
+  if (!func) {
+    __android_log_print(ANDROID_LOG_VERBOSE, LOGCAT_TAG, "couldn't find onTorRawAbort() in Java");
+    return;
+  }
+
+  (*jniEnv)->CallStaticVoidMethod(jniEnv, clazz, func);
+  (*jvm)->DetachCurrentThread(jvm);
+}
+
 /**
  * Call the abort() function to kill the current process with a fatal
  * error. But first, flush the raw error file descriptors, so error messages
@@ -222,6 +279,7 @@ void
 tor_raw_abort_(void)
 {
   tor_log_flush_sigsafe_err_fds();
+  attempt_to_tell_orbot_of_abort();
   abort();
 }
 

@@ -35,6 +35,10 @@ JNIEXPORT jboolean JNICALL
 Java_org_torproject_jni_TorService_mainConfigurationSetupControlSocket
 (JNIEnv *, jobject);
 
+JNIEXPORT jboolean JNICALL
+Java_org_torproject_jni_TorService_fatal
+(JNIEnv *, jobject);
+
 /*
  * Class:     org_torproject_jni_TorService
  * Method:    mainConfigurationFree
