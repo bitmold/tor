@@ -170,6 +170,7 @@ static void entry_guard_set_filtered_flags(const or_options_t *options,
 static void pathbias_check_use_success_count(entry_guard_t *guard);
 static void pathbias_check_close_success_count(entry_guard_t *guard);
 static int node_is_possible_guard(const node_t *node);
+static bridge_info_t *get_bridge_info_for_guard(const entry_guard_t *guard);
 static int node_passes_guard_filter(const or_options_t *options,
                                     const node_t *node);
 static entry_guard_t *entry_guard_add_to_sample_impl(guard_selection_t *gs,
@@ -589,9 +590,12 @@ mark_guard_maybe_reachable(entry_guard_t *guard)
      * sync with the descriptor fetch schedule, since we will refuse to
      * use the network until our first primary bridges are either
      * known-usable or known-unusable. See bug 40396. */
-    download_status_t *dl = get_bridge_dl_status_by_id(guard->identity);
-    if (dl)
-      download_status_reset(dl);
+    /* Unknown fingerprints are all zero, and even known fingerprints can
+     * identify multiple configured endpoints. Looking up the configured bridge
+     * by its guard selects the matching endpoint's schedule for reset. */
+    bridge_info_t *bridge = get_bridge_info_for_guard(guard);
+    if (bridge)
+      download_status_reset(bridge_get_dl_status(bridge));
   }
 }
 
@@ -1350,15 +1354,16 @@ sampled_guards_update_consensus_presence(guard_selection_t *gs)
 }
 
 /**
- * Enumerate <b>sampled_entry_guards</b> smartlist in <b>gs</b>.
- * For each <b>entry_guard_t</b> object in smartlist, do the following:
+ * Walk through the <b>sampled_entry_guards</b> smartlist in <b>gs</b>.
+ *
+ * For each <b>entry_guard_t</b> object in the smartlist:
+ *
  * * If <b>currently_listed</b> is false and <b>unlisted_since_date</b>
  *   is earlier than <b>remove_if_unlisted_since</b> - remove it.
- * * Otherwise, check if <b>sampled_on_date</b> is earlier than
- *   <b>maybe_remove_if_sampled_before</b>.
- *   * When above condition is correct, remove the guard if:
- *     * It was never confirmed.
- *     * It was confirmed before <b>remove_if_confirmed_before</b>.
+ * * Otherwise, if it is confirmed and it was confirmed before
+ *   <b>remove_if_confirmed_before</b> - remove it.
+ * * Otherwise, if it is not confirmed and it was sampled before
+ *   <b>maybe_remove_if_sampled_before</b> - remove it.
  *
  * Require <b>gs</b> to be non-null pointer.
  * Return number of entries deleted.
@@ -1383,22 +1388,25 @@ sampled_guards_prune_obsolete_entries(guard_selection_t *gs,
          {FIRST_UNLISTED_AT} is over get_remove_unlisted_guards_after_days()
          days in the past."
       */
+      rmv = 1;
       log_info(LD_GUARD, "Removing sampled guard %s: it has been unlisted "
                "for over %d days", entry_guard_describe(guard),
                get_remove_unlisted_guards_after_days());
-      rmv = 1;
-    } else if (guard->sampled_on_date < maybe_remove_if_sampled_before) {
-      /* We have a live consensus, and {ADDED_ON_DATE} is over
-        {GUARD_LIFETIME} ago, *and* {CONFIRMED_ON_DATE} is either
-        "never", or over {GUARD_CONFIRMED_MIN_LIFETIME} ago.
-      */
-      if (guard->confirmed_on_date == 0) {
+    } else if (guard->confirmed_on_date == 0) {
+      if (guard->sampled_on_date < maybe_remove_if_sampled_before) {
+        /* We have a live consensus, and this guard isn't confirmed, and
+         * {ADDED_ON_DATE} is over {GUARD_LIFETIME} ago. */
         rmv = 1;
         log_info(LD_GUARD, "Removing sampled guard %s: it was sampled "
                  "over %d days ago, but never confirmed.",
                  entry_guard_describe(guard),
                  get_guard_lifetime() / 86400);
-      } else if (guard->confirmed_on_date < remove_if_confirmed_before) {
+      }
+    } else { /* guard is confirmed */
+      if (guard->confirmed_on_date < remove_if_confirmed_before) {
+        /* We have a live consensus, and {CONFIRMED_ON_DATE} is not
+         * "never", and {CONFIRMED_ON_DATE} is over
+         * {GUARD_CONFIRMED_MIN_LIFETIME} ago. */
         rmv = 1;
         log_info(LD_GUARD, "Removing sampled guard %s: it was sampled "
                  "over %d days ago, and confirmed over %d days ago.",
@@ -2638,61 +2646,50 @@ entry_guard_cancel(circuit_guard_state_t **guard_state_p)
   if (BUG(*guard_state_p == NULL))
     return;
   entry_guard_t *guard = entry_guard_handle_get((*guard_state_p)->guard);
-  if (! guard)
-    return;
-
-  /* XXXX prop271 -- last_tried_to_connect_at will be erroneous here, but this
-   * function will only get called in "bug" cases anyway. */
-  guard->is_pending = 0;
+  /* Ordinary circuit and directory cleanup also cancel selection state.
+   * This clears pending bookkeeping if the guard survives, but leaves
+   * reachability unchanged: disposing of a request neither proves failure nor
+   * reverses an already-recorded connection failure. The channel's independent
+   * handle, if any, remains responsible for its establishment result. */
+  if (guard)
+    guard->is_pending = 0;
   circuit_guard_state_free(*guard_state_p);
   *guard_state_p = NULL;
 }
 
-/**
- * Called by the circuit building module when a circuit has failed:
- * informs the guards code that the guard in *<b>guard_state_p</b> is
- * not working, and advances the state of the guard module.
- */
-void
-entry_guard_failed(circuit_guard_state_t **guard_state_p)
+/** Acquires an independent weak handle from borrowed selection state. */
+struct entry_guard_handle_t *
+entry_guard_handle_from_state(const circuit_guard_state_t *state)
 {
-  if (BUG(*guard_state_p == NULL))
-    return;
-
-  entry_guard_t *guard = entry_guard_handle_get((*guard_state_p)->guard);
-  if (! guard || BUG(guard->in_selection == NULL))
-    return;
-
-  entry_guards_note_guard_failure(guard->in_selection, guard);
-
-  (*guard_state_p)->state = GUARD_CIRC_STATE_DEAD;
-  (*guard_state_p)->state_set_at = approx_time();
+  entry_guard_t *guard = state ? entry_guard_handle_get(state->guard) : NULL;
+  return guard ? entry_guard_handle_new(guard) : NULL;
 }
 
-/**
- * Run the entry_guard_failed() function on every circuit that is
- * pending on <b>chan</b>.
- */
+/** Releases a channel's independently owned weak handle. */
 void
-entry_guard_chan_failed(channel_t *chan)
+entry_guard_handle_release(struct entry_guard_handle_t *handle)
 {
-  if (!chan)
+  entry_guard_handle_free(handle);
+}
+
+/** Records one failed connection through its launch-time selection. Neither
+ * a received identity nor a change of active selection redirects this
+ * result. The handle is borrowed; the caller retains ownership.
+ *
+ * The caller must establish that the failure is eligible for guard attribution
+ * and enforce at most one delivery per connection attempt. This helper only
+ * checks that the selected guard still exists in a selection and, for bridges,
+ * remains configured. It neither consumes the handle nor checks connection
+ * phase, direction, cancellation, or whether networking is enabled. */
+void
+entry_guard_connection_failed(struct entry_guard_handle_t *handle)
+{
+  entry_guard_t *guard = entry_guard_handle_get(handle);
+  if (!guard || !guard->in_selection)
     return;
-
-  smartlist_t *pending = smartlist_new();
-  circuit_get_all_pending_on_channel(pending, chan);
-  SMARTLIST_FOREACH_BEGIN(pending, circuit_t *, circ) {
-    if (!CIRCUIT_IS_ORIGIN(circ))
-      continue;
-
-    origin_circuit_t *origin_circ = TO_ORIGIN_CIRCUIT(circ);
-    if (origin_circ->guard_state) {
-      /* We might have no guard state if we didn't use a guard on this
-       * circuit (eg it's for a fallback directory). */
-      entry_guard_failed(&origin_circ->guard_state);
-    }
-  } SMARTLIST_FOREACH_END(circ);
-  smartlist_free(pending);
+  if (guard->bridge_addr && !get_bridge_info_for_guard(guard))
+    return;
+  entry_guards_note_guard_failure(guard->in_selection, guard);
 }
 
 /**
@@ -3467,16 +3464,15 @@ entry_guard_get_by_id_digest(const char *digest)
       get_guard_selection_info(), digest);
 }
 
-/** We are about to connect to bridge with identity <b>digest</b> to fetch its
+/** We are about to connect to configured <b>bridge</b> to fetch its
  *  descriptor. Create a new guard state for this connection and return it. */
 circuit_guard_state_t *
-get_guard_state_for_bridge_desc_fetch(const char *digest)
+get_guard_state_for_bridge_desc_fetch(const bridge_info_t *bridge)
 {
   circuit_guard_state_t *guard_state = NULL;
   entry_guard_t *guard = NULL;
 
-  guard = entry_guard_get_by_id_digest_for_guard_selection(
-                                    get_guard_selection_info(), digest);
+  guard = get_sampled_guard_for_bridge(get_guard_selection_info(), bridge);
   if (!guard) {
     return NULL;
   }

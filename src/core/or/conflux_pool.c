@@ -478,6 +478,17 @@ validate_unlinked_legs(unlinked_circuits_t *unlinked)
       // a cwnd worth of sent data to retransmit. We're not going to try
       // this in C-Tor, but arti could consider it.
     }
+
+    // Symmetrically: the other end cannot have received more than we ever
+    // sent on this set.  cfx_add_leg() copies this value into the new leg's
+    // last_seq_sent; an inflated value there makes cfx_del_leg() believe the
+    // leg was "in active use" (max_seq_sent(others) < leg->last_seq_sent) and
+    // tear the whole set down on an ordinary leg close / purpose change.
+    if (leg->link->last_seqno_recv > conflux_get_max_seq_sent(unlinked->cfx)) {
+      log_fn(unlinked->is_client ? LOG_NOTICE : LOG_PROTOCOL_WARN, LD_CIRC,
+             "Conflux leg claims to have received more than we sent.");
+      valid = false;
+    }
     validate_circ_has_no_streams(leg->circ);
   } SMARTLIST_FOREACH_END(leg);
 
@@ -506,7 +517,14 @@ cfx_add_leg(conflux_t *cfx, leg_t *leg)
   // (It seems the other side will have no idea what our current maxes
   /// are, so this option seems better right now)
   cleg->last_seq_recv = leg->link->last_seqno_sent;
-  cleg->last_seq_sent = leg->link->last_seqno_recv;
+  /* validate_unlinked_legs() already rejected a last_seqno_recv above the
+   * set's max_seq_sent; clamp anyway so the invariant
+   *   new_leg->last_seq_sent <= conflux_get_max_seq_sent(cfx)
+   * holds locally, whoever the caller is. */
+  {
+    const uint64_t max_seq_sent = conflux_get_max_seq_sent(cfx);
+    cleg->last_seq_sent = MIN(leg->link->last_seqno_recv, max_seq_sent);
+  }
   cleg->circ_rtts_usec = leg->rtt_usec;
   cleg->linked_sent_usec = leg->link_sent_usec;
 
@@ -682,8 +700,14 @@ conflux_mark_all_for_close(const uint8_t *nonce, bool is_client, int reason)
    * set. This happens if there is a recovery leg launched for an existing
    * linked set. */
 
+  /* Make a local copy of nonce first, since it might be part of a conflux
+   * leg that gets freed by the various calls in this function. */
+  uint8_t nonce_localcopy[DIGEST256_LEN];
+  memcpy(nonce_localcopy, nonce, sizeof(nonce_localcopy));
+
   /* Close the unlinked set. */
-  unlinked_circuits_t *unlinked = unlinked_pool_get(nonce, is_client);
+  unlinked_circuits_t *unlinked =
+    unlinked_pool_get(nonce_localcopy, is_client);
   if (unlinked) {
     unlinked_close_or_free(unlinked);
   }
@@ -692,7 +716,7 @@ conflux_mark_all_for_close(const uint8_t *nonce, bool is_client, int reason)
 
   /* Close the linked set. It will free itself upon the close of
    * the last leg. */
-  conflux_t *linked = linked_pool_get(nonce, is_client);
+  conflux_t *linked = linked_pool_get(nonce_localcopy, is_client);
   if (linked) {
     if (linked->in_full_teardown) {
       return;
@@ -1453,6 +1477,10 @@ conflux_get_circ_for_conn(const entry_connection_t *conn, time_t now,
       continue;
     }
 
+    /* The stream will be carried by every leg of this set, and every leg
+     * holds the same isolation state so the check above on the first leg
+     * answers for the whole set. */
+
     /* Found a circuit that works. */
     return ocirc;
   } DIGEST256MAP_FOREACH_END;
@@ -1619,6 +1647,27 @@ linked_circuit_closed(circuit_t *circ)
    * attached to the circuit so it can be freed in conflux_circuit_free(). */
   if (CONFLUX_NUM_LEGS(circ->conflux) > 0) {
     circ->conflux = NULL;
+  } else {
+    /* We are the last leg. We normally keep the conflux object attached to
+     * this circuit so it can be freed later in linked_circuit_free(). However,
+     * if an unlinked set (for instance a recovery leg launched for the same
+     * nonce) still shares this very same conflux object, it can revive it
+     * (conflux_process_linked() -> try_finalize_set()) and become a second
+     * owner. Were we to keep our reference, both this circuit and the revived
+     * linked set would point at the same conflux object and both would try to
+     * free it once reaped, leading to a use-after-free and double free. Hand
+     * ownership over to the unlinked set now -- it becomes responsible for
+     * freeing the conflux object -- and detach it from this circuit. */
+    unlinked_circuits_t *unlinked = unlinked_pool_get(nonce, is_client);
+    if (unlinked && unlinked->cfx == circ->conflux) {
+      /* We expect the unlinked set sharing our conflux object to be flagged as
+       * belonging to a linked set. If not, something is off in our bookkeeping
+       * but we can still recover by handing ownership over, so warn loudly
+       * rather than assert. */
+      BUG(!unlinked->is_for_linked_set);
+      unlinked->is_for_linked_set = false;
+      circ->conflux = NULL;
+    }
   }
 
   /* If this was a teardown condition, we need to mark other circuits,
@@ -1811,6 +1860,22 @@ conflux_process_link(circuit_t *circ, const relay_msg_t *msg)
     goto end;
   }
 
+  /* Only a plain OR circuit may become a conflux leg.  A circuit this relay
+   * already turned into an intro point or a rendezvous point (purpose
+   * INTRO_POINT / REND_POINT_WAITING / REND_ESTABLISHED) will have its purpose
+   * changed again later (e.g. RENDEZVOUS1 -> REND_ESTABLISHED), and any
+   * purpose change on a conflux circuit is treated as a close of that leg
+   * (circuit_change_purpose() -> conflux_circuit_has_closed()), which can tear
+   * the whole set down and mark this very circuit for close in the middle of
+   * the rendezvous splice -- assert_circuit_ok() then aborts the relay. */
+  if (circ->purpose != CIRCUIT_PURPOSE_OR) {
+    log_fn(LOG_PROTOCOL_WARN, LD_CIRC,
+           "Got a CONFLUX_LINK cell on a circuit with purpose %s. "
+           "Closing circuit.", circuit_purpose_to_string(circ->purpose));
+    circuit_mark_for_close(circ, END_CIRC_REASON_TORPROTOCOL);
+    goto end;
+  }
+
   if (!conflux_validate_source_hop(circ, NULL)) {
     log_fn(LOG_PROTOCOL_WARN, LD_CIRC,
            "Got a CONFLUX_LINK with further hops. Closing circuit.");
@@ -1829,6 +1894,16 @@ conflux_process_link(circuit_t *circ, const relay_msg_t *msg)
   if (circ->conflux) {
     log_fn(LOG_PROTOCOL_WARN, LD_CIRC,
            "Got a CONFLUX_LINK on an already linked circuit "
+           "Closing circuit.");
+    circuit_mark_for_close(circ, END_CIRC_REASON_TORPROTOCOL);
+    goto end;
+  }
+
+  /* A LINK must arrive on a fresh circuit that has no attached streams. */
+  if (TO_OR_CIRCUIT(circ)->n_streams ||
+      TO_OR_CIRCUIT(circ)->resolving_streams) {
+    log_fn(LOG_PROTOCOL_WARN, LD_CIRC,
+           "Got a CONFLUX_LINK on a circuit with attached streams. "
            "Closing circuit.");
     circuit_mark_for_close(circ, END_CIRC_REASON_TORPROTOCOL);
     goto end;
@@ -1881,7 +1956,11 @@ conflux_process_link(circuit_t *circ, const relay_msg_t *msg)
    * And so, we need to sync the streams before that happens that is before we
    * receive the LINKED_ACK. */
   if (link_circuit(circ) != ERR_LINK_CIRC_OK) {
-    circuit_mark_for_close(circ, END_CIRC_REASON_TORPROTOCOL);
+    /* On an invalid leg, try_finalize_set() already tore the unlinked set
+     * down, which marked this very circuit. */
+    if (!circ->marked_for_close) {
+      circuit_mark_for_close(circ, END_CIRC_REASON_TORPROTOCOL);
+    }
     goto end;
   }
 
@@ -1975,6 +2054,7 @@ conflux_process_linked(circuit_t *circ, crypt_path_t *layer_hint,
     log_fn(LOG_PROTOCOL_WARN, LD_CIRC,
            "Received CONFLUX_LINKED but circuit nonce doesn't match "
            "cell nonce. Closing circuit.");
+    tor_free(link);
     goto close;
   }
 
@@ -1983,6 +2063,7 @@ conflux_process_linked(circuit_t *circ, crypt_path_t *layer_hint,
   if (BUG(!leg)) {
     log_warn(LD_CIRC, "Received CONFLUX_LINKED but can't find "
                       "associated leg. Closing circuit.");
+    tor_free(link);
     goto close;
   }
 

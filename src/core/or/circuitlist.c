@@ -1342,6 +1342,15 @@ circuit_clear_cpath(origin_circuit_t *circ)
   cpath_free(cpath);
 
   circ->cpath = NULL;
+  /* This will ensure that we don't accept any more authenticated
+   * SENDMEs on this circuit if we have already registered a hop,
+   * since an origin circuit never receives a relay cell from
+   * a NULL layer.
+   *
+   * In practice this funciton is only called from tests and form
+   * circuit_free_, so there's no actual risk of confusion.
+   */
+  circ->base_.sendme_digest_hop = NULL;
 }
 
 /** Release all storage held by circuits. */
@@ -1351,6 +1360,12 @@ circuit_free_all(void)
   smartlist_t *lst = circuit_get_global_list();
 
   SMARTLIST_FOREACH_BEGIN(lst, circuit_t *, tmp) {
+    tmp->global_circuitlist_idx = -1;
+    /* Must run before the resolving_streams loop below: for conflux circuits,
+     * this calls linked_circuit_free() -> linked_nullify_streams(), which
+     * NULLs the shared stream pointer on non-last legs so that the loop is
+     * a no-op for them and only the last leg actually frees the streams. */
+    circuit_about_to_free_atexit(tmp);
     if (! CIRCUIT_IS_ORIGIN(tmp)) {
       or_circuit_t *or_circ = TO_OR_CIRCUIT(tmp);
       while (or_circ->resolving_streams) {
@@ -1360,8 +1375,6 @@ circuit_free_all(void)
         or_circ->resolving_streams = next_conn;
       }
     }
-    tmp->global_circuitlist_idx = -1;
-    circuit_about_to_free_atexit(tmp);
     circuit_free(tmp);
     SMARTLIST_DEL_CURRENT(lst, tmp);
   } SMARTLIST_FOREACH_END(tmp);
@@ -1686,6 +1699,17 @@ circuit_unlink_all_from_channel(channel_t *chan, int reason)
   SMARTLIST_FOREACH_BEGIN(detached, circuit_t *, circ) {
     int mark = 0;
     if (circ->n_chan == chan) {
+      /* An established connection can fail while CREATE is outstanding.
+       * Notify its pending directory requests here: generic circuit cleanup
+       * must not mistake cancellation for a failed connection. */
+      if (!circ->marked_for_close && CIRCUIT_IS_ORIGIN(circ)) {
+        origin_circuit_t *ocirc = TO_ORIGIN_CIRCUIT(circ);
+        if (ocirc->cpath &&
+            ocirc->cpath->state == CPATH_STATE_AWAITING_KEYS) {
+          connection_ap_fail_onehop(ocirc->cpath->extend_info->identity_digest,
+                                    ocirc->build_state);
+        }
+      }
 
       circuit_set_n_circid_chan(circ, 0, NULL);
       mark = 1;
@@ -2159,6 +2183,7 @@ circuit_synchronize_written_or_bandwidth(const circuit_t *c,
 
 /** Mark <b>circ</b> to be closed next time we call
  * circuit_close_all_marked(). Do any cleanup needed:
+ *   - If state is CHAN_WAIT, remove circ from circuits_pending_chans.
  *   - If state is onionskin_pending, remove circ from the onion_pending
  *     list.
  *   - If circ isn't open yet: call circuit_build_failed() if we're
@@ -2241,6 +2266,18 @@ circuit_mark_for_close_, (circuit_t *circ, int reason, int line,
   circ->marked_for_close_file = file;
   circ->marked_for_close_reason = reason;
   circ->marked_for_close_orig_reason = orig_reason;
+
+  if (CIRCUIT_IS_ORIGIN(circ))
+    circuit_build_times_note_connection_failure(TO_ORIGIN_CIRCUIT(circ),
+                                               orig_reason);
+
+  /* Marked circuits must not remain on the pending channel list (waiting for a
+   * n_chan) even before the deferred cleanup in circuit_about_to_free(). */
+  if (circ->state == CIRCUIT_STATE_CHAN_WAIT) {
+    if (circuits_pending_chans) {
+      smartlist_remove(circuits_pending_chans, circ);
+    }
+  }
 
   if (!CIRCUIT_IS_ORIGIN(circ)) {
     or_circuit_t *or_circ = TO_OR_CIRCUIT(circ);
@@ -2351,10 +2388,6 @@ circuit_about_to_free(circuit_t *circ)
       origin_circuit_t *ocirc = TO_ORIGIN_CIRCUIT(circ);
       circuit_build_failed(ocirc); /* take actions if necessary */
     }
-  }
-  if (circ->state == CIRCUIT_STATE_CHAN_WAIT) {
-    if (circuits_pending_chans)
-      smartlist_remove(circuits_pending_chans, circ);
   }
   if (circuits_pending_other_guards) {
     smartlist_remove(circuits_pending_other_guards, circ);

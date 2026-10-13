@@ -441,6 +441,7 @@ static void
 node_addrs_changed(node_t *node)
 {
   node->last_reachable = node->last_reachable6 = 0;
+  node->reached_ipv4_orport = node->reached_ipv6_orport = 0;
   node->country = -1;
 }
 
@@ -769,6 +770,7 @@ nodelist_set_consensus(const networkstatus_t *ns)
       node->is_stable = rs->is_stable;
       node->is_possible_guard = rs->is_possible_guard;
       node->is_exit = rs->is_exit;
+      node->is_middle_only = rs->is_middle_only;
       if (!authdir) {
         /* Authdirs treat is_bad_exit specially in that they only assign
          * it when the descriptor arrives. So when a dir auth is reading
@@ -850,6 +852,9 @@ nodelist_remove_routerinfo(routerinfo_t *ri)
   node_t *node = node_get_mutable_by_id(ri->cache_info.identity_digest);
   if (node && node->ri == ri) {
     node->ri = NULL;
+    /* The next descriptor may have other ORPorts, and we won't be able to
+     * compare. (last_reachable{,6} are kept: they also decide Running.) */
+    node->reached_ipv4_orport = node->reached_ipv6_orport = 0;
     if (! node_is_usable(node)) {
       nodelist_drop_node(node, 1);
       node_free(node);
@@ -2369,7 +2374,9 @@ router_find_exact_exit_enclave(const char *address, uint16_t port)
   tor_addr_from_in(&ipv4_addr, &in);
 
   SMARTLIST_FOREACH(nodelist_get_list(), const node_t *, node, {
-    if (tor_addr_eq(node_get_prim_addr_ipv4(node), &ipv4_addr) &&
+    const tor_addr_t *prim = node_get_prim_addr_ipv4(node);
+    if (prim &&
+        tor_addr_eq(prim, &ipv4_addr) &&
         node->is_running &&
         compare_tor_addr_to_node_policy(&ipv4_addr, port, node) ==
           ADDR_POLICY_ACCEPTED &&

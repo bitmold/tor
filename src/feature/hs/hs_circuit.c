@@ -995,10 +995,14 @@ hs_circ_service_get_established_intro_circ(const hs_service_intro_point_t *ip)
  * - The rendezvous circuit failed to connect to the RP.
  *
  * We avoid relaunching a connection to this rendezvous point if:
- * - We have already tried MAX_REND_FAILURES times to connect to this RP,
+ * - We have already tried MAX_REND_FAILURES times to connect to this RP, or
  * - We've been trying to connect to this RP for more than MAX_REND_TIMEOUT
- *   seconds, or
- * - We've already retried this specific rendezvous circuit.
+ *   seconds.
+ *
+ * This is not idempotent: every call that passes the checks above launches
+ * a new circuit carrying a copy of circ's hs_ident (rendezvous cookie,
+ * handshake info and key seed). It must therefore be reached exactly once
+ * per dying circuit.
  */
 void
 hs_circ_retry_service_rendezvous_point(const origin_circuit_t *circ)
@@ -1476,6 +1480,14 @@ hs_circ_send_introduce1(origin_circuit_t *intro_circ,
     goto close;
   }
 
+  if (BUG(fast_mem_is_zero((char *)rend_circ->hs_ident->rendezvous_cookie,
+                           HS_REND_COOKIE_LEN))) {
+    /* make sure we aren't somehow sending an intro cell without
+     * initializing the rendezvous cookie. this is defense-in-depth for
+     * bugs like #41297. */
+    goto close;
+  }
+
   /* Set the PoW solution if any. */
   intro1_data.pow_solution = pow_solution;
 
@@ -1498,7 +1510,9 @@ hs_circ_send_introduce1(origin_circuit_t *intro_circ,
   /* From the introduce1 data object, this will encode the INTRODUCE1 cell
    * into payload which is then ready to be sent as is. */
   payload_len = hs_cell_build_introduce1(&intro1_data, payload);
-  if (BUG(payload_len < 0)) {
+  if (payload_len < 0) {
+    log_fn(LOG_PROTOCOL_WARN, LD_REND,
+           "Problem building introduce1 cell. Closing circuit.");
     goto close;
   }
 
@@ -1568,6 +1582,10 @@ hs_circ_send_establish_rendezvous(origin_circuit_t *circ)
     memwipe(cell, 0, cell_len);
     goto err;
   }
+
+  /* Record that we sent the cell, so we can make sure our state is as
+   * expected. */
+  circ->hs_ident->sent_establish_rendezvous = 1;
 
   memwipe(cell, 0, cell_len);
   return 0;

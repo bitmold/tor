@@ -112,6 +112,7 @@
 #include "app/config/or_state_st.h"
 #include "feature/nodelist/routerinfo_st.h"
 #include "core/or/socks_request_st.h"
+#include "core/or/relay.h"
 
 #ifdef HAVE_UNISTD_H
 #include <unistd.h>
@@ -558,7 +559,11 @@ get_main_loop_idle_count(void)
 
 /** Check whether <b>conn</b> is correct in having (or not having) a
  * read/write event (passed in <b>ev</b>). On success, return 0. On failure,
- * log a warning and return -1. */
+ * log a warning and return -1.
+ *
+ * In addition, if conn is a DNS request initiated by the DNSPort or the
+ * controller, it won't have an event associated with it, so the caller must
+ * not proceed. Return -1 in this case too to tell the caller the stop. */
 static int
 connection_check_event(connection_t *conn, struct event *ev)
 {
@@ -593,6 +598,14 @@ connection_check_event(connection_t *conn, struct event *ev)
     log_backtrace(LOG_WARN, LD_BUG, "Backtrace attached.");
     return -1;
   }
+
+  if (conn->type == CONN_TYPE_AP && TO_EDGE_CONN(conn)->is_dns_request) {
+    /* Be sure not to let the caller proceed if ev is NULL. Otherwise it
+     * will do things like call event_del on the NULL event. See tickets
+     * 16248 and 41265 for details. */
+    return -1;
+  }
+
   return 0;
 }
 
@@ -1161,7 +1174,7 @@ directory_info_has_arrived(time_t now, int from_cache, int suppress_logs)
 /** Perform regular maintenance tasks for a single connection.  This
  * function gets run once per second per connection by run_scheduled_events.
  */
-static void
+STATIC void
 run_connection_housekeeping(int i, time_t now)
 {
   cell_t cell;
@@ -1242,7 +1255,7 @@ run_connection_housekeeping(int i, time_t now)
       /* We never managed to actually get this connection open and happy. */
       log_info(LD_OR,"Expiring non-open OR connection to fd %d (%s:%d).",
                (int)conn->s, fmt_and_decorate_addr(&conn->addr), conn->port);
-      connection_or_close_normally(TO_OR_CONN(conn), 0);
+      connection_or_close_for_error(or_conn, 0);
     }
   } else if (we_are_hibernating() &&
              ! have_any_circuits &&
@@ -2480,6 +2493,14 @@ run_main_loop_once(void)
    * of these happens, then run all the appropriate callbacks. */
   loop_result = tor_libevent_run_event_loop(tor_libevent_get_base(),
                                             called_loop_once);
+
+  if (mainloop_must_free_memory) {
+    /* Note that calling event_base_loopbreak() can set the return value
+     * to -1, so we need to clear it in this case. :/
+     */
+    cell_queues_reclaim_memory();
+    loop_result = 0;
+  }
 
   if (get_options()->MainloopStats) {
     /* Update our main loop counters. */

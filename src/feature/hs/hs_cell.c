@@ -15,6 +15,7 @@
 #include "feature/hs/hs_ob.h"
 #include "core/crypto/hs_ntor.h"
 #include "core/or/congestion_control_common.h"
+#include "lib/crypt_ops/crypto_curve25519.h"
 
 #include "core/or/origin_circuit_st.h"
 
@@ -289,9 +290,11 @@ introduce1_set_encrypted_padding(const trn_cell_introduce1_t *cell,
 /** Encrypt the ENCRYPTED payload and encode it in the cell using the enc_cell
  * and the INTRODUCE1 data.
  *
- * This can't fail but it is very important that the caller sets every field
- * in data so the computation of the INTRODUCE1 keys doesn't fail. */
-static void
+ * It is very important that the caller sets every field
+ * in data so the computation of the INTRODUCE1 keys doesn't fail.
+ *
+ * Return 0 on success, -1 if we should fail the circuit. */
+static int
 introduce1_encrypt_and_encode(trn_cell_introduce1_t *cell,
                               const trn_cell_introduce_encrypted_t *enc_cell,
                               const hs_cell_introduce1_data_t *data)
@@ -310,7 +313,7 @@ introduce1_encrypt_and_encode(trn_cell_introduce1_t *cell,
   tor_assert(enc_cell);
   tor_assert(data);
 
-  /* Encode the cells up to now of what we have to we can perform the MAC
+  /* Encode the cells up to now of what we have so we can perform the MAC
    * computation on it. */
   encoded_cell_len = trn_cell_introduce1_encode(encoded_cell,
                                                 sizeof(encoded_cell), cell);
@@ -327,7 +330,9 @@ introduce1_encrypt_and_encode(trn_cell_introduce1_t *cell,
   if (hs_ntor_client_get_introduce1_keys(data->auth_pk, data->enc_pk,
                                          data->client_kp,
                                          data->subcredential, &keys) < 0) {
-    tor_assert_unreached();
+    /* this can happen in practice if e.g. the onion service is rude
+     * and sets one of its introduction keys to all-zero. */
+    return -1;
   }
 
   /* Prepare cipher with the encryption key just computed. */
@@ -372,6 +377,7 @@ introduce1_encrypt_and_encode(trn_cell_introduce1_t *cell,
   memwipe(encrypted, 0, encrypted_len);
   memwipe(encoded_enc_cell, 0, sizeof(encoded_enc_cell));
   tor_free(encrypted);
+  return 0;
 }
 
 /** Build the PoW cell extension and put it in the given extensions object.
@@ -469,8 +475,8 @@ build_introduce_cc_extension(trn_extension_t *extensions)
 }
 
 /** Using the INTRODUCE1 data, setup the ENCRYPTED section in cell. This means
- * set it, encrypt it and encode it. */
-static void
+ * set it, encrypt it, and encode it. Return 0 on success, -1 on failure. */
+static int
 introduce1_set_encrypted(trn_cell_introduce1_t *cell,
                          const hs_cell_introduce1_data_t *data)
 {
@@ -510,10 +516,12 @@ introduce1_set_encrypted(trn_cell_introduce1_t *cell,
   introduce1_set_encrypted_padding(cell, enc_cell);
 
   /* Encrypt and encode it in the cell. */
-  introduce1_encrypt_and_encode(cell, enc_cell, data);
+  if (introduce1_encrypt_and_encode(cell, enc_cell, data) < 0)
+    return -1;
 
   /* Cleanup. */
   trn_cell_introduce_encrypted_free(enc_cell);
+  return 0;
 }
 
 /** Set the authentication key in the INTRODUCE1 cell from the given data. */
@@ -1012,9 +1020,16 @@ hs_cell_parse_introduce2(hs_cell_introduce2_data_t *data,
     goto done;
   }
 
-  /* Check our replay cache for this introduction point. */
-  if (replaycache_add_test_and_elapsed(data->replay_cache, encrypted_section,
-                                       encrypted_section_len, &elapsed)) {
+  /* Bound insertions even between periodic introduction point expiry checks.
+   * Retain existing entries until this introduction point is destroyed. */
+  if (replay_cache_count(data->replay_cache) >= ip->introduce2_max) {
+    goto done;
+  }
+
+  /* Reject known replays before authentication, but do not cache a new cell
+   * until all cell validation has succeeded. */
+  if (replaycache_test_and_elapsed(data->replay_cache, encrypted_section,
+                                   encrypted_section_len, &elapsed)) {
     log_warn(LD_REND, "Possible replay detected! An INTRODUCE2 cell with the "
                       "same ENCRYPTED section was seen %ld seconds ago. "
                       "Dropping cell.", (long int) elapsed);
@@ -1077,6 +1092,14 @@ hs_cell_parse_introduce2(hs_cell_introduce2_data_t *data,
   memcpy(data->rdv_data.onion_pk.public_key,
          trn_cell_introduce_encrypted_getconstarray_onion_key(enc_cell),
          CURVE25519_PUBKEY_LEN);
+  if (!curve25519_public_key_is_ok(&data->rdv_data.onion_pk)) {
+    log_fn(LOG_PROTOCOL_WARN, LD_REND,
+           "Invalid rendezvous onion key in INTRODUCE2 cell on "
+           "circuit %u for service %s. Dropping cell.",
+           TO_CIRCUIT(circ)->n_circ_id,
+           safe_str_client(service->onion_address));
+    goto done;
+  }
   memcpy(data->rdv_data.rendezvous_cookie,
          trn_cell_introduce_encrypted_getconstarray_rend_cookie(enc_cell),
          sizeof(data->rdv_data.rendezvous_cookie));
@@ -1118,6 +1141,12 @@ hs_cell_parse_introduce2(hs_cell_introduce2_data_t *data,
   if (data->rdv_data.cc_enabled && !congestion_control_enabled()) {
     goto done;
   }
+
+  /* Only validated cells consume cache space and count towards cache-based
+   * rotation. Keep these even if the caller rejects the rendezvous cookie:
+   * its replay cache expires entries, while this cache must not. */
+  replaycache_add_and_test(data->replay_cache, encrypted_section,
+                          encrypted_section_len);
 
   /* Success. */
   ret = 0;
@@ -1199,7 +1228,8 @@ hs_cell_build_introduce1(const hs_cell_introduce1_data_t *data,
 
   /* Set the encrypted section. This will set, encrypt and encode the
    * ENCRYPTED section in the cell. After this, we'll be ready to encode. */
-  introduce1_set_encrypted(cell, data);
+  if (introduce1_set_encrypted(cell, data) < 0)
+    return -1;
 
   /* Final encoding. */
   cell_len = trn_cell_introduce1_encode(cell_out,
